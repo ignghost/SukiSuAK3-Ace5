@@ -1081,6 +1081,7 @@ jobs:
             set_config "CONFIG_DEVTMPFS=y"
             set_config "CONFIG_PID_NS=y"
             set_config "CONFIG_IPC_NS=y"
+            set_config "CONFIG_USER_NS=y"
             set_config "CONFIG_NAMESPACES=y"
             set_config "CONFIG_POSIX_MQUEUE=y"
             set_config "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
