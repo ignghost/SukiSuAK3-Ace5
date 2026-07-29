@@ -35,6 +35,19 @@ fun File.insertBefore(anchor: Regex, vararg newLines: String) {
     writeText(out.joinToString("\n") + "\n")
 }
 
+fun File.insertBeforeFirst(anchor: Regex, vararg newLines: String) {
+    val out = mutableListOf<String>()
+    var inserted = false
+    for (line in readLines()) {
+        if (!inserted && anchor.containsMatchIn(line)) {
+            out.addAll(newLines)
+            inserted = true
+        }
+        out.add(line)
+    }
+    writeText(out.joinToString("\n") + "\n")
+}
+
 /** sed '/pattern/d' —— 删除匹配到的行 */
 fun File.deleteLine(pattern: Regex) {
     val out = readLines().filterNot { pattern.containsMatchIn(it) }
@@ -81,25 +94,25 @@ fun f(relPath: String) = File(workDir, relPath)
 val fdinfoCommentStart = Regex("""^[ \t]*/\*$""")
 val fdinfoCommentEnd = Regex("""^[ \t]*u32 mask = mark->mask & IN_ALL_EVENTS;$""")
 
+val inotifyFdinfoFuncAnchor = Regex("""^static void inotify_fdinfo\(struct seq_file \*m, struct fsnotify_mark \*mark\)$""")
+
+fun addInotifyMarkUserMaskFunction(file: File) {
+    file.insertBeforeFirst(
+        inotifyFdinfoFuncAnchor,
+        "static inline u32 inotify_mark_user_mask(struct fsnotify_mark *mark)",
+        "{",
+        "\treturn mark->mask & IN_ALL_EVENTS;",
+        "}",
+        ""
+    )
+}
+
 fun applyFdinfo(file: File) {
     file.deleteBlock(fdinfoCommentStart, fdinfoCommentEnd)
     file.replaceEachLine(Regex("""\bmask,\s*mark->ignored_mask"""), "inotify_mark_user_mask(mark)")
     file.replaceEachLine(Regex("""ignored_mask:%x"""), "ignored_mask:0")
-}
-
-fun revertFdinfo(file: File) {
-    file.insertAfter(
-        Regex("""^\s+if \(inode\) \{"""),
-        "\t\t/*",
-        "\t\t * IN_ALL_EVENTS represents all of the mask bits",
-        "\t\t * that we expose to userspace.  There is at",
-        "\t\t * least one bit (FS_EVENT_ON_CHILD) which is",
-        "\t\t * used only internally to the kernel.",
-        "\t\t */",
-        "\t\tu32 mask = mark->mask & IN_ALL_EVENTS;"
-    )
-    file.replaceEachLine(Regex("""\binotify_mark_user_mask\(mark\)"""), "mask, mark->ignored_mask")
-    file.replaceEachLine(Regex("""ignored_mask:0"""), "ignored_mask:%x")
+    println("Adding inotify_mark_user_mask function definition")
+    addInotifyMarkUserMaskFunction(file)
 }
 
 // android15-6.6 SUBLEVEL<=30 特殊单独处理
@@ -150,6 +163,51 @@ fun revertAndroid15VmaBlock(taskMmu: File, namespace: File) {
     taskMmu.deleteLine(Regex("""pagemap_entry_t \*res = NULL;"""))
 }
 
+/** 兜底修复 */
+fun applyPostPatchFixups() {
+    val taskMmu = f("fs/proc/task_mmu.c")
+    if (taskMmu.exists()) {
+        val content = taskMmu.readText()
+        if (content.contains("VMA_PAD_START(") &&
+            !Regex("""#include <linux/pgsize_migration(_inline)?\.h>|define VMA_PAD_START""").containsMatchIn(content)
+        ) {
+            val lines = taskMmu.readLines().toMutableList()
+            lines.addAll(
+                1,
+                listOf(
+                    "#ifndef VMA_PAD_START",
+                    "#define VMA_PAD_START(vma) ((vma)->vm_end)",
+                    "#endif"
+                )
+            )
+            taskMmu.writeText(lines.joinToString("\n") + "\n")
+            println("Added VMA_PAD_START fallback definition to fs/proc/task_mmu.c")
+        }
+
+        val content2 = taskMmu.readText()
+        if (content2.contains("__fold_filemap_fixup_entry") &&
+            !content2.contains("#include <linux/page_size_compat.h>")
+        ) {
+            taskMmu.insertAfter(
+                Regex("""#include <linux/pkeys\.h>"""),
+                "#include <linux/page_size_compat.h>"
+            )
+            println("Added page_size_compat.h include to fs/proc/task_mmu.c")
+        }
+    }
+
+    if (kmi == "android12-5.10" || kmi == "android13-5.10") {
+        val namei = f("fs/namei.c")
+        if (namei.exists() && namei.readText().contains("set_nameidata(nd, old_dfd, fake_filename, NULL)")) {
+            println("Fixing set_nameidata calls for 5.10 (4-arg -> 3-arg)")
+            namei.replaceEachLine(
+                Regex("""set_nameidata\(nd, old_dfd, fake_filename, NULL\)"""),
+                "set_nameidata(nd, old_dfd, fake_filename)"
+            )
+        }
+    }
+}
+
 // Main
 fun apply() {
     if (kmi == "android12-5.10") {
@@ -162,6 +220,13 @@ fun apply() {
         }
         if (sublevel <= 117) {
             println("Applying fdinfo.c Android 12 5.10 Fake Patch")
+            applyFdinfo(f("fs/notify/fdinfo.c"))
+        }
+    }
+
+    if (kmi == "android13-5.10") {
+        if (sublevel <= 107) {
+            println("Applying fdinfo.c Android 13 5.10 Fake Patch")
             applyFdinfo(f("fs/notify/fdinfo.c"))
         }
     }
@@ -196,6 +261,13 @@ fun apply() {
     }
 
     if (kmi == "android14-6.1") {
+        if (sublevel <= 25) {
+            println("Applying base.c Android 14 6.1 Fake Patch")
+            f("fs/proc/base.c").insertAfter(
+                Regex("""^#include <trace/events/oom\.h>$"""),
+                "#include <trace/hooks/sched.h>"
+            )
+        }
         if (sublevel <= 141) {
             println("Applying base.c Android 14 6.1 Fake Patch")
             f("fs/proc/base.c").insertAfter(
@@ -235,7 +307,13 @@ fun apply() {
             println("Applying exec.c Android 16 6.12 Fake Patch")
             f("fs/exec.c").deleteLine(Regex("""^#include <linux/dma-buf\.h>$"""))
         }
+        if (sublevel >= 69) {
+            println("Applying task_mmu.c Android 16 6.12 Fake Patch")
+            f("fs/proc/task_mmu.c").replaceEachLine(Regex("""vma_data_pages"""), "vma_pages")
+        }
     }
+
+    applyPostPatchFixups()
 }
 
 fun revert() {
@@ -247,10 +325,6 @@ fun revert() {
                 "int this_len = min_t(int, count, PAGE_SIZE);"
             )
         }
-        if (sublevel <= 117) {
-            println("Reverting fdinfo.c Android 12 5.10 Fake Patch")
-            revertFdinfo(f("fs/notify/fdinfo.c"))
-        }
     }
 
     if (kmi == "android13-5.15") {
@@ -259,8 +333,6 @@ fun revert() {
             f("fs/namespace.c").deleteLine(Regex("""#include <linux/mnt_idmapping\.h>$"""))
             println("Reverting open.c Android 13 5.15 Fake Patch")
             f("fs/open.c").deleteLine(Regex("""#include <linux/mnt_idmapping\.h>$"""))
-            println("Reverting fdinfo.c Android 13 5.15 Fake Patch")
-            revertFdinfo(f("fs/notify/fdinfo.c"))
             f("fs/susfs.c").replaceEachLine(
                 Regex(Regex.escape("i_uid_into_mnt(i_user_ns(&fi->inode), &fi->inode).val")),
                 "i_uid_into_mnt(&init_user_ns, &fi->inode).val"
@@ -294,6 +366,10 @@ fun revert() {
     }
 
     if (kmi == "android14-6.1") {
+        if (sublevel <= 25) {
+            println("Reverting base.c Android 14 6.1 Fake Patch")
+            f("fs/proc/base.c").deleteLine(Regex("""^#include <trace/hooks/sched\.h>$"""))
+        }
         if (sublevel <= 141) {
             println("Reverting base.c Android 14 6.1 Fake Patch")
             f("fs/proc/base.c").deleteLine(Regex("""^#include <linux/dma-buf\.h>$"""))
@@ -326,6 +402,10 @@ fun revert() {
         if (sublevel >= 58) {
             println("Reverting exec.c Android 16 6.12 Fake Patch")
             f("fs/exec.c").insertAfterFirst(Regex("""^#include """), "#include <linux/dma-buf.h>")
+        }
+        if (sublevel >= 69) {
+            println("Reverting task_mmu.c Android 16 6.12 Fake Patch")
+            f("fs/proc/task_mmu.c").replaceEachLine(Regex("""vma_pages"""), "vma_data_pages")
         }
     }
 }
