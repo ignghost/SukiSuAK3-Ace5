@@ -86,7 +86,7 @@ fun File.replaceWholeLine(oldLine: String, newLine: String) {
 
 val kmi = System.getenv("KMI") ?: ""
 val sublevel = (System.getenv("SUBLEVEL") ?: "0").toIntOrNull() ?: 0
-val mode = args.getOrNull(0) ?: "apply" // apply | revert
+val mode = args.getOrNull(0) ?: "apply" // apply | postfix | revert
 val workDir = args.getOrNull(1) ?: "kernel_workspace/kernel_platform/common"
 
 fun f(relPath: String) = File(workDir, relPath)
@@ -185,14 +185,34 @@ fun applyPostPatchFixups() {
         }
 
         val content2 = taskMmu.readText()
-        if (content2.contains("__fold_filemap_fixup_entry") &&
-            !content2.contains("#include <linux/page_size_compat.h>")
+        if (content2.contains("__fold_filemap_fixup_entry(") &&
+            !Regex("""static\s+inline\s+void\s+__fold_filemap_fixup_entry""").containsMatchIn(content2)
         ) {
-            taskMmu.insertAfter(
-                Regex("""#include <linux/pkeys\.h>"""),
-                "#include <linux/page_size_compat.h>"
-            )
-            println("Added page_size_compat.h include to fs/proc/task_mmu.c")
+            val headerFile = f("include/linux/page_size_compat.h")
+            val headerDeclaresFn = headerFile.exists() && headerFile.readText().contains("__fold_filemap_fixup_entry")
+
+            if (headerDeclaresFn) {
+                if (!content2.contains("#include <linux/page_size_compat.h>")) {
+                    val lines = taskMmu.readLines().toMutableList()
+                    lines.add(1, "#include <linux/page_size_compat.h>")
+                    taskMmu.writeText(lines.joinToString("\n") + "\n")
+                    println("Added page_size_compat.h include to fs/proc/task_mmu.c")
+                }
+            } else {
+                val lines = taskMmu.readLines().toMutableList()
+                val lastIncludeIdx = lines.indexOfLast { it.trimStart().startsWith("#include") }
+                val insertAt = if (lastIncludeIdx >= 0) lastIncludeIdx + 1 else 1
+                lines.addAll(
+                    insertAt,
+                    listOf(
+                        "#ifndef __fold_filemap_fixup_entry",
+                        "static inline void __fold_filemap_fixup_entry(struct vma_iterator *iter, unsigned long *end) { }",
+                        "#endif /* __fold_filemap_fixup_entry */"
+                    )
+                )
+                taskMmu.writeText(lines.joinToString("\n") + "\n")
+                println("page_size_compat.h missing or doesn't declare __fold_filemap_fixup_entry on this baseline; added local stub to fs/proc/task_mmu.c")
+            }
         }
     }
 
@@ -313,6 +333,9 @@ fun apply() {
         }
     }
 
+}
+
+fun postfix() {
     applyPostPatchFixups()
 }
 
@@ -412,9 +435,10 @@ fun revert() {
 
 when (mode) {
     "apply" -> apply()
+    "postfix" -> postfix()
     "revert" -> revert()
     else -> {
-        println("Usage: kotlin PatchFakePatches.main.kts <apply|revert> [workDir]")
+        println("Usage: kotlin PatchFakePatches.main.kts <apply|postfix|revert> [workDir]")
         exitProcess(1)
     }
 }
