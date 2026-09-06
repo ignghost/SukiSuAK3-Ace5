@@ -675,6 +675,12 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${KSU_MANAGER_BRANCH}/kernel/setup.sh" | bash -s "$KSU_BUILTIN_BRANCH"
           cd ./KernelSU
 
+          - name: Fix SukiSu Pointer Error
+    run: |
+    cd kernel_workspace/kernel_platform/common
+    echo 'EXTRA_CFLAGS+=" -Wno-error=incompatible-function-pointer-types"' >> build.config.ext
+    echo 'EXTRA_CFLAGS+=" -Wno-error=incompatible-function-pointer-types"' >> build.config.gki.aarch64
+
 
           # 如果指定了手动 hash，就切换到该提交
           if [[ -n "$MANUAL_HASH" ]]; then
