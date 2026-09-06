@@ -675,10 +675,6 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${KSU_MANAGER_BRANCH}/kernel/setup.sh" | bash -s "$KSU_BUILTIN_BRANCH"
           cd ./KernelSU
 
-          - name: Patch KernelSU umount set function
-  run: |
-    sed -i 's/int ksu_umount_set(u64 \*val)/int ksu_umount_set(u64 val)/g' kernel_workspace/kernel_platform/common/drivers/kernelsu/feature/kernel_umount.c
-    sed -i 's/ksu_umount_set(&val)/ksu_umount_set(val)/g' kernel_workspace/kernel_platform/common/drivers/kernelsu/feature/kernel_umount.c
 
           # 如果指定了手动 hash，就切换到该提交
           if [[ -n "$MANUAL_HASH" ]]; then
