@@ -692,6 +692,19 @@ jobs:
           GIT_HASH=$(git rev-parse --short HEAD)
           echo "GIT_HASH=$GIT_HASH"
 
+          # The SukiSU driver version code is derived from the main branch commit count.
+          # Keep the exact main commit used for that calculation so the bundled Manager
+          # can be selected from the same build, avoiding the "kernel update required"
+          # version mismatch warning.
+          git fetch origin main >/dev/null 2>&1 || true
+          KSU_MAIN_SHA=$(git rev-parse main)
+          KSU_MAIN_COUNT=$(git rev-list --count main)
+          KSU_VERSION=$(expr "$KSU_MAIN_COUNT" + 37185)
+          echo "KSU_MAIN_SHA=$KSU_MAIN_SHA" >> $GITHUB_ENV
+          echo "KSU_MAIN_COUNT=$KSU_MAIN_COUNT" >> $GITHUB_ENV
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+          echo "SukiSU version code: $KSU_VERSION (main=$KSU_MAIN_SHA)"
+
           # 组装版本号
           if [[ -n "$MANUAL_HASH" ]]; then
             USE_HASH="$SHORT_HASH"
@@ -725,9 +738,6 @@ jobs:
           if grep -q '^KSU_VERSION_API := ' kernel/Makefile; then
             sed -i "s|^KSU_VERSION_API := .*|KSU_VERSION_API := $ESC_KSU_VERSION_TAG|" kernel/Makefile
           fi
-
-          KSU_VERSION=$(expr $(git rev-list --count "$KSU_MANAGER_BRANCH" 2>/dev/null || echo 13000) + 37185)
-          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
 
           echo "::group::最终 Makefile 中版本信息及部分调试结果预览"
           grep -nE '^(REPO_OWNER|REPO_NAME|REPO_BRANCH|KSU_VERSION_API|KSU_VERSION_FULL|VERSION_TAG|GIT_BIN|CURL_BIN)' kernel/Makefile
@@ -1652,31 +1662,46 @@ jobs:
           wget -O ksu_module_susfs_1.5.2+_Release.zip https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip
           cp ksu_module_susfs_1.5.2+_Release.zip ./AnyKernel3/
 
-      - name: Download Latest SukiSU-Ultra APK from CI
-        continue-on-error: true
+      - name: Download Matching SukiSU-Ultra APK from CI
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           MANAGER_ARTIFACT=Manager
 
-          echo "Using branch: $KSU_MANAGER_BRANCH"
-          echo "Downloading artifact: $MANAGER_ARTIFACT"
+          echo "Selecting SukiSU Manager for exact main commit: $KSU_MAIN_SHA"
+          echo "Expected SukiSU version code: $KSUVER"
 
-          run_id=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/workflows/build-manager.yml/runs?branch=$KSU_MANAGER_BRANCH&status=success&event=push&per_page=1" --jq '.workflow_runs[0].id' || echo "")
+          # Do not use the latest successful Manager from a branch. That can be
+          # newer/older than the driver compiled into this kernel and causes the
+          # SukiSU "kernel update required" / version mismatch warning.
+          run_id=$(gh api \
+            "repos/SukiSU-Ultra/SukiSU-Ultra/actions/workflows/build-manager.yml/runs?head_sha=$KSU_MAIN_SHA&status=success&per_page=20" \
+            --jq '.workflow_runs[] | select(.head_sha == "'$KSU_MAIN_SHA'") | .id' | head -n1 || true)
 
           if [[ -z "$run_id" ]]; then
-            echo "No successful workflow run found on branch $KSU_MANAGER_BRANCH. Skipping download."
-            exit 0
+            echo "ERROR: No successful SukiSU Manager build exists for exact commit $KSU_MAIN_SHA."
+            echo "Refusing to package an unrelated Manager because that can trigger the kernel-update-required warning."
+            exit 1
           fi
-          artifact_url=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/runs/$run_id/artifacts" | jq -r ".artifacts[] | select(.name == \"$MANAGER_ARTIFACT\") | .archive_download_url" | head -n1)
 
-          if [[ -z "$artifact_url" ]]; then
-            echo "No artifact '$MANAGER_ARTIFACT' found in run $run_id. Skipping download."
-            exit 0
+          echo "Matched Manager workflow run: $run_id"
+          artifact_url=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/runs/$run_id/artifacts" \
+            --jq '.artifacts[] | select(.name == "'$MANAGER_ARTIFACT'") | .archive_download_url' | head -n1)
+
+          if [[ -z "$artifact_url" || "$artifact_url" == "null" ]]; then
+            echo "ERROR: Manager artifact '$MANAGER_ARTIFACT' was not found in run $run_id."
+            exit 1
           fi
-          echo "Downloading from: $artifact_url"
+
           curl -fL -H "Authorization: token $GITHUB_TOKEN" -o "${MANAGER_ARTIFACT}.zip" "$artifact_url"
-          unzip -j "${MANAGER_ARTIFACT}.zip" "*.apk" -d ./AnyKernel3/
+          rm -rf ./AnyKernel3/.sukisu-manager && mkdir -p ./AnyKernel3/.sukisu-manager
+          unzip -j "${MANAGER_ARTIFACT}.zip" "*.apk" -d ./AnyKernel3/.sukisu-manager/
+          APK=$(find ./AnyKernel3/.sukisu-manager -maxdepth 1 -type f -name '*.apk' | head -n1)
+          test -n "$APK"
+          mv "$APK" ./AnyKernel3/
+          rmdir ./AnyKernel3/.sukisu-manager
+          echo "Bundled Manager is from the exact SukiSU source commit used for this kernel."
 
       - name: Set zip Suffix
         id: suffix
