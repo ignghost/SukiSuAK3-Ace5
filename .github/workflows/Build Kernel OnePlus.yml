@@ -975,6 +975,58 @@ jobs:
           source $REJ_CHECKER
           check_rejects .
 
+      - name: Apply NoMount Built-in
+        run: |
+          set -euo pipefail
+          KERNEL_TREE="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common"
+          NOMOUNT_TAG="v2.0.0"
+          NOMOUNT_REPO="https://github.com/maxsteeel/nomount.git"
+
+          echo "Installing NoMount $NOMOUNT_TAG as a built-in kernel subsystem..."
+          cd "$KERNEL_TREE"
+
+          if [ ! -d "NoMount/.git" ]; then
+            git clone --depth=1 --branch "$NOMOUNT_TAG" "$NOMOUNT_REPO" NoMount
+          else
+            git -C NoMount fetch --depth=1 origin "refs/tags/$NOMOUNT_TAG"
+            git -C NoMount checkout --detach "$NOMOUNT_TAG"
+          fi
+
+          if [ ! -d "NoMount/kernel/src" ]; then
+            echo "❌ NoMount kernel source directory is missing"
+            exit 1
+          fi
+
+          if [ ! -f "fs/Kconfig" ] || [ ! -f "fs/Makefile" ]; then
+            echo "❌ Kernel fs/Kconfig or fs/Makefile is missing"
+            exit 1
+          fi
+
+          rm -rf fs/nomount
+          ln -s "$(realpath --relative-to="fs" "NoMount/kernel/src")" fs/nomount
+
+          if ! grep -qF 'obj-$(CONFIG_NOMOUNT) += nomount/' fs/Makefile; then
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+          fi
+
+          if ! grep -qF 'source "fs/nomount/Kconfig"' fs/Kconfig; then
+            awk '
+              /^endmenu/ && !inserted {
+                print "source \"fs/nomount/Kconfig\""
+                inserted=1
+              }
+              { print }
+            ' fs/Kconfig > fs/Kconfig.tmp
+            mv fs/Kconfig.tmp fs/Kconfig
+          fi
+
+          echo "CONFIG_NOMOUNT=y" >> /tmp/nomount-required.config
+
+          echo "✅ NoMount source integrated"
+          echo "   Source: $KERNEL_TREE/NoMount/kernel/src"
+          echo "   Kconfig: fs/nomount/Kconfig"
+          echo "   Build:   CONFIG_NOMOUNT=y"
+
       - name: Apply LZ4_DEV
         if: ${{ github.event.inputs.LZ4_UPDATE == 'true' }}
         run: |
@@ -1094,6 +1146,9 @@ jobs:
 
           # SukiSU Ultra配置
           set_config "CONFIG_KSU=y"
+
+          # NoMount built-in configuration
+          set_config "CONFIG_NOMOUNT=y"
 
           # KPM配置
           if [ "${{ github.event.inputs.KPM }}" = "KPM" ] || [ "${{ github.event.inputs.KPM }}" = "N/A" ]; then
