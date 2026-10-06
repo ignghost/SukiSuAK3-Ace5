@@ -302,24 +302,20 @@ jobs:
           fi
 
           echo "解析 README.md 获取 CPUD 和 BUILD_METHOD..."
-          CPUD=""
-          BUILD_METHOD=""
-
           if [[ -s "$README_PATH" ]]; then
             BUILD_LINE=$(grep -m1 'oplus_build_kernel.sh' "$README_PATH" || true)
             if [[ -n "$BUILD_LINE" ]]; then
               CPUD=$(echo "$BUILD_LINE" | awk '{print $(NF-1)}')
               BUILD_METHOD=$(echo "$BUILD_LINE" | awk '{print $NF}')
-              echo "✅ README build profile: CPUD=$CPUD, BUILD_METHOD=$BUILD_METHOD"
+              echo "✅ CPUD=$CPUD, BUILD_METHOD=$BUILD_METHOD"
+              echo "CPUD=$CPUD" >> $GITHUB_ENV
+              echo "BUILD_METHOD=$BUILD_METHOD" >> $GITHUB_ENV
             else
-              echo "⚠️ README.md 中未找到构建命令；构建阶段将自动检测 source tree"
+              echo "❌ README.md 中未找到构建命令"
             fi
           else
-            echo "⚠️ README.md 下载失败或为空；构建阶段将自动检测 source tree"
+            echo "❌ README.md 下载失败或为空"
           fi
-
-          echo "CPUD=$CPUD" >> $GITHUB_ENV
-          echo "BUILD_METHOD=$BUILD_METHOD" >> $GITHUB_ENV
 
           # 传递组合信息
           echo "value=${FILE_BASE}_Android${ANDROID_VERSION}" >> "$GITHUB_OUTPUT"
@@ -696,22 +692,6 @@ jobs:
           GIT_HASH=$(git rev-parse --short HEAD)
           echo "GIT_HASH=$GIT_HASH"
 
-          # The SukiSU driver version code is derived from the main branch commit count.
-          # Keep the exact main commit used for that calculation so the bundled Manager
-          # can be selected from the same build, avoiding the "kernel update required"
-          # version mismatch warning.
-          # The setup script normally checks out the builtin branch.  A plain
-          # `git fetch origin main` does not guarantee a local `main` branch,
-          # so always use the remote-tracking ref for the authoritative count.
-          git fetch origin main:refs/remotes/origin/main
-          KSU_MAIN_SHA=$(git rev-parse origin/main)
-          KSU_MAIN_COUNT=$(git rev-list --count origin/main)
-          KSU_VERSION=$(expr "$KSU_MAIN_COUNT" + 37185)
-          echo "KSU_MAIN_SHA=$KSU_MAIN_SHA" >> $GITHUB_ENV
-          echo "KSU_MAIN_COUNT=$KSU_MAIN_COUNT" >> $GITHUB_ENV
-          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-          echo "SukiSU version code: $KSU_VERSION (main=$KSU_MAIN_SHA)"
-
           # 组装版本号
           if [[ -n "$MANUAL_HASH" ]]; then
             USE_HASH="$SHORT_HASH"
@@ -746,28 +726,12 @@ jobs:
             sed -i "s|^KSU_VERSION_API := .*|KSU_VERSION_API := $ESC_KSU_VERSION_TAG|" kernel/Makefile
           fi
 
+          KSU_VERSION=$(expr $(git rev-list --count "$KSU_MANAGER_BRANCH" 2>/dev/null || echo 13000) + 37185)
+          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+
           echo "::group::最终 Makefile 中版本信息及部分调试结果预览"
           grep -nE '^(REPO_OWNER|REPO_NAME|REPO_BRANCH|KSU_VERSION_API|KSU_VERSION_FULL|VERSION_TAG|GIT_BIN|CURL_BIN)' kernel/Makefile
           echo "::endgroup::"
-
-      - name: Verify SukiSU Kernel Version
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/kernel_platform/KernelSU
-          echo "===== SukiSU kernel version verification ====="
-          echo "Expected version code: $KSUVER"
-          echo "Exact SukiSU main commit: $KSU_MAIN_SHA"
-          ACTUAL_COUNT=$(git rev-list --count origin/main)
-          ACTUAL_VERSION=$(expr "$ACTUAL_COUNT" + 37185)
-          echo "Recomputed version code: $ACTUAL_VERSION"
-          if [ "$ACTUAL_VERSION" != "$KSUVER" ]; then
-            echo "❌ SukiSU version calculation mismatch"
-            exit 1
-          fi
-          if ! grep -q "KSU_VERSION_FULL" kernel/Makefile; then
-            echo "⚠️ KSU_VERSION_FULL is not present in kernel/Makefile; continuing"
-          fi
-          echo "✅ Kernel SukiSU version is internally consistent"
 
       - name: Apply Fake Patches
         if: ${{ github.event.inputs.SUSFS_META != '-1' }}
@@ -1011,58 +975,6 @@ jobs:
           source $REJ_CHECKER
           check_rejects .
 
-      - name: Apply NoMount Built-in
-        run: |
-          set -euo pipefail
-          KERNEL_TREE="$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common"
-          NOMOUNT_TAG="v2.0.0"
-          NOMOUNT_REPO="https://github.com/maxsteeel/nomount.git"
-
-          echo "Installing NoMount $NOMOUNT_TAG as a built-in kernel subsystem..."
-          cd "$KERNEL_TREE"
-
-          if [ ! -d "NoMount/.git" ]; then
-            git clone --depth=1 --branch "$NOMOUNT_TAG" "$NOMOUNT_REPO" NoMount
-          else
-            git -C NoMount fetch --depth=1 origin "refs/tags/$NOMOUNT_TAG"
-            git -C NoMount checkout --detach "$NOMOUNT_TAG"
-          fi
-
-          if [ ! -d "NoMount/kernel/src" ]; then
-            echo "❌ NoMount kernel source directory is missing"
-            exit 1
-          fi
-
-          if [ ! -f "fs/Kconfig" ] || [ ! -f "fs/Makefile" ]; then
-            echo "❌ Kernel fs/Kconfig or fs/Makefile is missing"
-            exit 1
-          fi
-
-          rm -rf fs/nomount
-          ln -s "$(realpath --relative-to="fs" "NoMount/kernel/src")" fs/nomount
-
-          if ! grep -qF 'obj-$(CONFIG_NOMOUNT) += nomount/' fs/Makefile; then
-            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
-          fi
-
-          if ! grep -qF 'source "fs/nomount/Kconfig"' fs/Kconfig; then
-            awk '
-              /^endmenu/ && !inserted {
-                print "source \"fs/nomount/Kconfig\""
-                inserted=1
-              }
-              { print }
-            ' fs/Kconfig > fs/Kconfig.tmp
-            mv fs/Kconfig.tmp fs/Kconfig
-          fi
-
-          echo "CONFIG_NOMOUNT=y" >> /tmp/nomount-required.config
-
-          echo "✅ NoMount source integrated"
-          echo "   Source: $KERNEL_TREE/NoMount/kernel/src"
-          echo "   Kconfig: fs/nomount/Kconfig"
-          echo "   Build:   CONFIG_NOMOUNT=y"
-
       - name: Apply LZ4_DEV
         if: ${{ github.event.inputs.LZ4_UPDATE == 'true' }}
         run: |
@@ -1182,9 +1094,6 @@ jobs:
 
           # SukiSU Ultra配置
           set_config "CONFIG_KSU=y"
-
-          # NoMount built-in configuration
-          set_config "CONFIG_NOMOUNT=y"
 
           # KPM配置
           if [ "${{ github.event.inputs.KPM }}" = "KPM" ] || [ "${{ github.event.inputs.KPM }}" = "N/A" ]; then
@@ -1578,122 +1487,27 @@ jobs:
             return "$status"
           }
 
-          # Select the build frontend from what the synced manifest actually
-          # contains.  Do not assume every OnePlus/Ace manifest has the legacy
-          # kernel_platform/oplus/build/oplus_build_kernel.sh path.
-          BAZEL_BUILD_SCRIPT=""
           if [ -f ./kernel_platform/build_with_bazel.py ]; then
-            BAZEL_BUILD_SCRIPT="./kernel_platform/build_with_bazel.py"
-          elif [ -f ./kernel_platform/build/build_with_bazel.py ]; then
-            BAZEL_BUILD_SCRIPT="./kernel_platform/build/build_with_bazel.py"
-          fi
-
-          OPLUS_BUILD_SCRIPT=""
-          for candidate in \
-            ./kernel/oplus/build/oplus_build_kernel.sh \
-            ./kernel_platform/oplus/build/oplus_build_kernel.sh \
-            ./kernel_platform/build/oplus_build_kernel.sh \
-            ./kernel_platform/oplus/oplus_build_kernel.sh \
-            ./kernel_platform/common/oplus/build/oplus_build_kernel.sh; do
-            if [ -f "$candidate" ]; then
-              OPLUS_BUILD_SCRIPT="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$OPLUS_BUILD_SCRIPT" ]; then
-            OPLUS_BUILD_SCRIPT=$(find . -type f -name 'oplus_build_kernel.sh' -print -quit 2>/dev/null || true)
-          fi
-
-          # Some Ace 5 Race B manifests are GKI/Kleaf-style trees and do not
-          # ship the legacy OPlus wrapper at all.  Detect their actual build
-          # entry points before declaring the build frontend missing.
-          GENERIC_BUILD_SCRIPT=""
-          for candidate in \
-            ./kernel_platform/build/build.sh \
-            ./kernel_platform/common/build/build.sh \
-            ./kernel_platform/build/kernel/build.sh; do
-            if [ -f "$candidate" ]; then
-              GENERIC_BUILD_SCRIPT="$candidate"
-              break
-            fi
-          done
-
-          if [ -z "$GENERIC_BUILD_SCRIPT" ]; then
-            GENERIC_BUILD_SCRIPT=$(find ./kernel_platform -maxdepth 6 -type f \
-              \( -path '*/build/build.sh' -o -name 'build_kernel.sh' \) -print -quit 2>/dev/null || true)
-          fi
-
-          echo "===== Build frontend detection =====" | tee -a "$BUILD_LOG"
-          echo "build_with_bazel.py: ${BAZEL_BUILD_SCRIPT:-NOT FOUND}" | tee -a "$BUILD_LOG"
-          echo "oplus_build_kernel.sh: ${OPLUS_BUILD_SCRIPT:-NOT FOUND}" | tee -a "$BUILD_LOG"
-          echo "generic build.sh: ${GENERIC_BUILD_SCRIPT:-NOT FOUND}" | tee -a "$BUILD_LOG"
-
-          # Ace 5 Race B is MediaTek MT6989. The current vendor build wrapper
-          # accepts the platform name mt6989 and the GKI build type.
-          if [ "${{ github.event.inputs.FILE }}" = "oneplus_ace5_race_b" ]; then
-            CPUD="mt6989"
-            BUILD_METHOD="gki"
-            echo "CPUD=$CPUD" >> "$GITHUB_ENV"
-            echo "BUILD_METHOD=$BUILD_METHOD" >> "$GITHUB_ENV"
-            echo "Ace 5 Race B build profile: CPUD=$CPUD, BUILD_METHOD=$BUILD_METHOD" | tee -a "$BUILD_LOG"
-          fi
-
-          if [ -n "$BAZEL_BUILD_SCRIPT" ]; then
             echo "===== Bazel kernel build =====" | tee -a "$BUILD_LOG"
-            if [ -x ./kernel_platform/oplus/bazel/oplus_modules_variant.sh ]; then
-              run_and_capture ./kernel_platform/oplus/bazel/oplus_modules_variant.sh \
-                ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
-            else
-              echo "⚠️ oplus_modules_variant.sh not present; continuing with build_with_bazel.py" | tee -a "$BUILD_LOG"
-            fi
+            run_and_capture ./kernel_platform/oplus/bazel/oplus_modules_variant.sh \
+              ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
 
             echo "===== build_with_bazel.py =====" | tee -a "$BUILD_LOG"
+            # Bazel understands --verbose_failures/--sandbox_debug.  Pass them
+            # through only if this build script accepts extra Bazel arguments.
             set +e
-            "$BAZEL_BUILD_SCRIPT" -t ${{ env.CPUD }} ${{ env.BUILD_METHOD }} \
+            ./kernel_platform/build_with_bazel.py -t ${{ env.CPUD }} ${{ env.BUILD_METHOD }} \
               --verbose_failures --sandbox_debug 2>&1 | tee -a "$BUILD_LOG"
             status=${PIPESTATUS[0]}
             set -e
-          elif [ -n "$OPLUS_BUILD_SCRIPT" ]; then
-            echo "===== OPlus kernel build =====" | tee -a "$BUILD_LOG"
-            echo "Using: $OPLUS_BUILD_SCRIPT" | tee -a "$BUILD_LOG"
-            chmod +x "$OPLUS_BUILD_SCRIPT"
-            set +e
-            LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 \
-            "$OPLUS_BUILD_SCRIPT" "${CPUD:-${{ env.CPUD }}}" "${BUILD_METHOD:-${{ env.BUILD_METHOD }}}" \
-            2>&1 | tee -a "$BUILD_LOG"
-            status=${PIPESTATUS[0]}
-            set -e
-          elif [ -n "$GENERIC_BUILD_SCRIPT" ]; then
-            echo "===== Generic kernel build frontend =====" | tee -a "$BUILD_LOG"
-            echo "Using: $GENERIC_BUILD_SCRIPT" | tee -a "$BUILD_LOG"
-            chmod +x "$GENERIC_BUILD_SCRIPT"
-            set +e
-            LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 \
-            "$GENERIC_BUILD_SCRIPT" "${CPUD:-${{ env.CPUD }}}" "${BUILD_METHOD:-${{ env.BUILD_METHOD }}}" \
-            2>&1 | tee -a "$BUILD_LOG"
-            status=${PIPESTATUS[0]}
-            set -e
           else
-            echo "❌ No supported OnePlus kernel build frontend was found in the synced source." | tee -a "$BUILD_LOG"
-            echo "Expected one of:" | tee -a "$BUILD_LOG"
-            echo "  - kernel_platform/build_with_bazel.py" | tee -a "$BUILD_LOG"
-            echo "  - kernel_platform/build/build_with_bazel.py" | tee -a "$BUILD_LOG"
-            echo "  - kernel/oplus/build/oplus_build_kernel.sh" | tee -a "$BUILD_LOG"
-            echo "  - kernel_platform/oplus/build/oplus_build_kernel.sh" | tee -a "$BUILD_LOG"
-            echo "  - another oplus_build_kernel.sh in the synced workspace" | tee -a "$BUILD_LOG"
-            echo "  - kernel_platform/build/build.sh or another generic build frontend" | tee -a "$BUILD_LOG"
-            echo "----- synced kernel build files -----" | tee -a "$BUILD_LOG"
-            find . -maxdepth 7 -type f \
-              \( -name 'build*.py' -o -name '*build*kernel*.sh' -o -name 'oplus_modules_variant.sh' -o -path '*/tools/bazel' \) \
-              -print | sort | tee -a "$BUILD_LOG" || true
-            echo "----- selected manifest/build metadata -----" | tee -a "$BUILD_LOG"
-            echo "FILE=${{ github.event.inputs.FILE }}" | tee -a "$BUILD_LOG"
-            echo "MANIFEST_REPO=${MANIFEST_REPO:-}" | tee -a "$BUILD_LOG"
-            echo "MANIFEST_BRANCH=${MANIFEST_BRANCH:-}" | tee -a "$BUILD_LOG"
-            echo "CPUD=${{ env.CPUD }}" | tee -a "$BUILD_LOG"
-            echo "BUILD_METHOD=${{ env.BUILD_METHOD }}" | tee -a "$BUILD_LOG"
-            status=127
+            echo "===== OPlus kernel build =====" | tee -a "$BUILD_LOG"
+            set +e
+            LTO=thin SYSTEM_DLKM_RE_SIGN=0 BUILD_SYSTEM_DLKM=0 KMI_SYMBOL_LIST_STRICT_MODE=0 \
+            ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }} \
+            2>&1 | tee -a "$BUILD_LOG"
+            status=${PIPESTATUS[0]}
+            set -e
           fi
 
           echo "===== Build diagnostic summary =====" | tee -a "$BUILD_LOG"
@@ -1710,200 +1524,31 @@ jobs:
 
       - name: Make AnyKernel3
         run: |
-          set -euo pipefail
           git clone https://github.com/Numbersf/AnyKernel3 --depth=1
           rm -rf ./AnyKernel3/.git
-
-          WORKSPACE="${GITHUB_WORKSPACE}/kernel_workspace"
-          FINAL_DIR="${WORKSPACE}/kernel_platform/out/Final-Image-Find"
-          mkdir -p "$FINAL_DIR"
-
-          echo "===== Kernel image discovery ====="
-          echo "Searching MTK/OnePlus output trees for the actual kernel payload."
-
+          mkdir -p kernel_workspace/kernel_platform/out/Final-Image-Find/
           image_path=""
-          source_kind=""
-
-          copy_raw() {
-            local src="$1"
-            [ -s "$src" ] || return 1
-            cp -f "$src" "$FINAL_DIR/Image"
-            image_path="$FINAL_DIR/Image"
-            source_kind="raw:$(basename "$src")"
-          }
-
-          unpack_lz4() {
-            local src="$1"
-            [ -s "$src" ] || return 1
-            command -v lz4 >/dev/null 2>&1 || {
-              echo "❌ lz4 is required to unpack $src" >&2
-              return 1
-            }
-            lz4 -d -f "$src" "$FINAL_DIR/Image"
-            [ -s "$FINAL_DIR/Image" ] || return 1
-            image_path="$FINAL_DIR/Image"
-            source_kind="lz4:$(basename "$src")"
-          }
-
-          unpack_gzip() {
-            local src="$1"
-            [ -s "$src" ] || return 1
-            gzip -dc "$src" > "$FINAL_DIR/Image"
-            [ -s "$FINAL_DIR/Image" ] || return 1
-            image_path="$FINAL_DIR/Image"
-            source_kind="gzip:$(basename "$src")"
-          }
-
-          # Prefer exact kernel-image names.  The MT6989 Ace 5 Race B build may
-          # emit Image.lz4-dtb rather than a plain Image.
-          for candidate in \
-            "$WORKSPACE/kernel/oplus/prebuild/dist/Image" \
-            "$WORKSPACE/kernel/oplus/prebuild/dist/Image.lz4-dtb" \
-            "$WORKSPACE/kernel/oplus/prebuild/dist/Image.lz4" \
-            "$WORKSPACE/kernel/oplus/prebuild/out/Image" \
-            "$WORKSPACE/kernel/oplus/prebuild/out/Image.lz4-dtb" \
-            "$WORKSPACE/kernel/oplus/prebuild/out/Image.lz4" \
-            "$WORKSPACE/kernel_platform/out/Image" \
-            "$WORKSPACE/kernel_platform/out/Image.lz4-dtb" \
-            "$WORKSPACE/kernel_platform/out/Image.lz4"; do
-            [ -f "$candidate" ] || continue
-            case "$candidate" in
-              *.lz4-dtb|*.lz4) unpack_lz4 "$candidate" && break ;;
-              *) copy_raw "$candidate" && break ;;
-            esac
-          done
-
-          # Search all common exact names if the fixed vendor locations above
-          # did not contain the final image.
-          if [ -z "$image_path" ]; then
-            while IFS= read -r candidate; do
-              case "$(basename "$candidate")" in
-                Image.lz4-dtb|Image.lz4-dtb.img|Image.lz4|kernel.lz4|kernel.lz4-dtb)
-                  if unpack_lz4 "$candidate"; then break; fi ;;
-                Image.gz-dtb|Image.gz|kernel.gz)
-                  if unpack_gzip "$candidate"; then break; fi ;;
-                Image|Image-dtb|Image-dtb.img|kernel|kernel-dtb)
-                  if copy_raw "$candidate"; then break; fi ;;
-              esac
-            done < <(find -L "$WORKSPACE" -type f \
-              \( -name 'Image*' -o -name 'kernel' -o -name 'kernel-*' \) \
-              -not -path '*/AnyKernel3/*' \
-              -not -path '*/Final-Image-Find/*' \
-              -print)
+          if [ -d "./kernel_workspace/kernel_platform/common/out/" ]; then
+            image_path=$(find "./kernel_workspace/kernel_platform/common/out/" -name "Image" | head -n 1)
+            if [ -n "$image_path" ]; then
+              echo "✅ 使用 make 编译的统一路径，成功找到 Image 文件"
+            fi
           fi
-
-          # Some Bazel/MTK outputs use a different directory but retain the
-          # kernel payload name. Search every .lz4/.gz candidate with a kernel-
-          # or image-related basename as a final compressed-image fallback.
-          if [ -z "$image_path" ]; then
-            while IFS= read -r candidate; do
-              base="$(basename "$candidate")"
-              case "$base" in
-                *Image*.lz4|*image*.lz4|*kernel*.lz4|*Kernel*.lz4)
-                  if unpack_lz4 "$candidate"; then break; fi ;;
-                *Image*.gz|*image*.gz|*kernel*.gz|*Kernel*.gz)
-                  if unpack_gzip "$candidate"; then break; fi ;;
-              esac
-            done < <(find -L "$WORKSPACE" -type f \( -name '*.lz4' -o -name '*.gz' \) \
-              -not -path '*/AnyKernel3/*' -not -path '*/Final-Image-Find/*' \
-              -print)
+          if [ -z "$image_path" ] && [ -d "./kernel_workspace/kernel_platform/out/" ]; then
+            image_path=$(find "./kernel_workspace/kernel_platform/out/" -name "Image" | head -n 1)
+            if [ -n "$image_path" ]; then
+              echo "✅ 使用官方脚本编译，成功找到 Image 文件"
+            fi
           fi
-
-          # Some MTK/OPlus GKI builds embed the kernel in boot.img instead of
-          # leaving a standalone Image. Extract it before giving up.
           if [ -z "$image_path" ]; then
-            unpack_boot_kernel() {
-              local boot_img="$1"
-              local out_dir="$FINAL_DIR/boot-unpack-$(basename "$boot_img" | tr -cd '[:alnum:]_.-')"
-              local unpacker=""
-              mkdir -p "$out_dir"
-              for tool in \
-                "$WORKSPACE/kernel_platform/tools/mkbootimg/unpack_bootimg.py" \
-                "$WORKSPACE/kernel_platform/build/tools/mkbootimg/unpack_bootimg.py" \
-                "$WORKSPACE/kernel/tools/mkbootimg/unpack_bootimg.py"; do
-                if [ -f "$tool" ]; then unpacker="$tool"; break; fi
-              done
-              if [ -z "$unpacker" ]; then
-                unpacker=$(find "$WORKSPACE/kernel_platform" "$WORKSPACE/kernel" -type f -name 'unpack_bootimg.py' -print -quit 2>/dev/null || true)
-              fi
-              if [ -n "$unpacker" ] && python3 "$unpacker" --boot_img "$boot_img" --out "$out_dir" >/dev/null 2>&1; then
-                for k in "$out_dir/kernel" "$out_dir/Image" "$out_dir/kernel.lz4" "$out_dir/kernel.lz4-dtb"; do
-                  [ -f "$k" ] || continue
-                  case "$k" in
-                    *.lz4*) unpack_lz4 "$k" && return 0 ;;
-                    *) copy_raw "$k" && return 0 ;;
-                  esac
-                done
-              fi
-              if command -v magiskboot >/dev/null 2>&1; then
-                local cwd="$PWD"
-                cd "$out_dir"
-                if magiskboot unpack "$boot_img" >/dev/null 2>&1; then
-                  for k in kernel Image kernel.lz4 kernel.lz4-dtb; do
-                    [ -f "$k" ] || continue
-                    case "$k" in
-                      *.lz4*) unpack_lz4 "$PWD/$k" && cd "$cwd" && return 0 ;;
-                      *) copy_raw "$PWD/$k" && cd "$cwd" && return 0 ;;
-                    esac
-                  done
-                fi
-                cd "$cwd"
-              fi
-              return 1
-            }
-            while IFS= read -r boot_img; do
-              [ -s "$boot_img" ] || continue
-              if unpack_boot_kernel "$boot_img"; then break; fi
-            done < <(find -L "$WORKSPACE" -type f \
-              \( -name 'boot.img' -o -name 'vendor_kernel_boot.img' -o -name 'boot-*.img' \) \
-              -not -path '*/AnyKernel3/*' -not -path '*/Final-Image-Find/*' -print)
-          fi
-
-          # If a raw kernel file is named only "kernel", accept it only when it
-          # looks like a Linux kernel binary; this avoids accidentally selecting
-          # an unrelated vendor blob.
-          if [ -z "$image_path" ]; then
-            while IFS= read -r candidate; do
-              [ -s "$candidate" ] || continue
-              if file "$candidate" 2>/dev/null | grep -Eqi 'Linux kernel|ARM64|aarch64'; then
-                copy_raw "$candidate" && break
-              fi
-            done < <(find -L "$WORKSPACE" -type f -name 'kernel' \
-              -not -path '*/AnyKernel3/*' -not -path '*/Final-Image-Find/*' -print)
-          fi
-
-          if [ -z "$image_path" ]; then
-            echo "----- kernel/image symlinks -----" >&2
-            find "$WORKSPACE" -type l \
-              \( -iname '*Image*' -o -iname '*kernel*' \) -print \
-              -exec sh -c 'printf "  -> %s\n" "$(readlink -f "$1" 2>/dev/null || true)"' _ {} \; || true
-            echo "----- Bazel kernel artifacts -----" >&2
-            find -L "$WORKSPACE/kernel_platform" "$WORKSPACE/kernel" -type f \
-              \( -iname '*Image*' -o -iname '*kernel*' \) \
-              -path '*/bazel-*/*' -print || true
-          fi
-
-          if [ -z "$image_path" ] || [ ! -s "$image_path" ]; then
-            echo "❌ 未找到可用的 kernel Image，构建失败" >&2
-            echo "----- all kernel/image-like files -----" >&2
-            find -L "$WORKSPACE" -type f \( \
-              -iname '*Image*' -o -iname '*kernel*' -o -name '*.lz4' -o -name '*.gz' \
-            \) -not -path '*/AnyKernel3/*' -print | while IFS= read -r f; do printf '%s\n' "$f" >&2; done || true
-            echo "----- largest build artifacts -----" >&2
-            find "$WORKSPACE" -type f -printf '%s %p\n' 2>/dev/null | while IFS= read -r line; do printf '%s\n' "$line" >&2; done || true
-            echo "----- build output directories -----" >&2
-            find "$WORKSPACE" -maxdepth 10 -type d \( \
-              -name 'bazel-bin' -o -name 'bazel-out' -o -name 'out' -o -name 'dist' -o -name 'prebuild' \
-            \) -print | while IFS= read -r d; do printf '%s\n' "$d" >&2; done || true
+            echo "❌ 未找到 Image 文件，构建失败" >&2
             exit 1
           fi
-
-          echo "✅ Kernel payload found: $source_kind"
-          echo "✅ Normalized Image: $image_path"
-          cp -f "$image_path" ./AnyKernel3/Image
-          echo "✅ AnyKernel3/Image prepared"
-          file ./AnyKernel3/Image || true
-          ls -lh ./AnyKernel3/Image "$FINAL_DIR/Image"
+          if [ -f "$image_path" ]; then
+            echo "✅ Image file finally located at: $image_path"
+            cp "$image_path" ./AnyKernel3/Image
+            cp "$image_path" kernel_workspace/kernel_platform/out/Final-Image-Find/Image
+          fi
 
       - name: Apply KPX and Replace Image
         if: ${{ github.event.inputs.KPM != 'N/A' }}
@@ -1952,59 +1597,31 @@ jobs:
           wget -O ksu_module_susfs_1.5.2+_Release.zip https://github.com/sidex15/ksu_module_susfs/releases/latest/download/ksu_module_susfs_1.5.2+.zip
           cp ksu_module_susfs_1.5.2+_Release.zip ./AnyKernel3/
 
-      - name: Download Matching SukiSU-Ultra APK from CI
+      - name: Download Latest SukiSU-Ultra APK from CI
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
           MANAGER_ARTIFACT=Manager
 
-          echo "Selecting SukiSU Manager for exact main commit: $KSU_MAIN_SHA"
-          echo "Expected SukiSU version code: $KSUVER"
+          echo "Using branch: $KSU_MANAGER_BRANCH"
+          echo "Downloading artifact: $MANAGER_ARTIFACT"
 
-          # Do not use the latest successful Manager from a branch. That can be
-          # newer/older than the driver compiled into this kernel and causes the
-          # SukiSU "kernel update required" / version mismatch warning.
-          # Search all successful workflow runs for this exact commit instead
-          # of hard-coding a workflow filename.  This survives upstream
-          # workflow renames while still guaranteeing an exact source match.
-          run_id=""
-          artifact_url=""
-          mapfile -t candidate_runs < <(gh api \
-            "repos/SukiSU-Ultra/SukiSU-Ultra/actions/runs?head_sha=$KSU_MAIN_SHA&status=success&per_page=100" \
-            --jq '.workflow_runs[] | select(.head_sha == "'$KSU_MAIN_SHA'") | .id' || true)
+          run_id=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/workflows/build-manager.yml/runs?branch=$KSU_MANAGER_BRANCH&status=success&event=push&per_page=1" --jq '.workflow_runs[0].id' || echo "")
 
-          for candidate in "${candidate_runs[@]}"; do
-            candidate_url=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/runs/$candidate/artifacts" \
-              --jq '.artifacts[] | select(.name == "'$MANAGER_ARTIFACT'") | .archive_download_url' | head -n1 || true)
-            if [[ -n "$candidate_url" && "$candidate_url" != "null" ]]; then
-              run_id="$candidate"
-              artifact_url="$candidate_url"
-              break
-            fi
-          done
-
-          if [[ -z "$run_id" || -z "$artifact_url" ]]; then
-            echo "ERROR: No successful SukiSU Manager artifact exists for exact commit $KSU_MAIN_SHA."
-            echo "Refusing to package an unrelated Manager because that can trigger the kernel-update-required warning."
-            exit 1
+          if [[ -z "$run_id" ]]; then
+            echo "No successful workflow run found on branch $KSU_MANAGER_BRANCH. Skipping download."
+            exit 0
           fi
+          artifact_url=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/runs/$run_id/artifacts" | jq -r ".artifacts[] | select(.name == \"$MANAGER_ARTIFACT\") | .archive_download_url" | head -n1)
 
-          echo "Matched Manager workflow run: $run_id"
-
-          if [[ -z "$artifact_url" || "$artifact_url" == "null" ]]; then
-            echo "ERROR: Manager artifact '$MANAGER_ARTIFACT' was not found in run $run_id."
-            exit 1
+          if [[ -z "$artifact_url" ]]; then
+            echo "No artifact '$MANAGER_ARTIFACT' found in run $run_id. Skipping download."
+            exit 0
           fi
-
+          echo "Downloading from: $artifact_url"
           curl -fL -H "Authorization: token $GITHUB_TOKEN" -o "${MANAGER_ARTIFACT}.zip" "$artifact_url"
-          rm -rf ./AnyKernel3/.sukisu-manager && mkdir -p ./AnyKernel3/.sukisu-manager
-          unzip -j "${MANAGER_ARTIFACT}.zip" "*.apk" -d ./AnyKernel3/.sukisu-manager/
-          APK=$(find ./AnyKernel3/.sukisu-manager -maxdepth 1 -type f -name '*.apk' | head -n1)
-          test -n "$APK"
-          mv "$APK" ./AnyKernel3/
-          rmdir ./AnyKernel3/.sukisu-manager
-          echo "Bundled Manager is from the exact SukiSU source commit used for this kernel."
+          unzip -j "${MANAGER_ARTIFACT}.zip" "*.apk" -d ./AnyKernel3/
 
       - name: Set zip Suffix
         id: suffix
