@@ -102,7 +102,7 @@ on:
         type: string
         description: "管理器分支名(必填)/内置分支名(必填)/自定义版本标识(留空不修改)/回退分支提交哈希版本(留空不修改)//Manager Branch name (Required) / Builtin branch name (Required) / Custom version identifier (Leave blank to not modify) / Rollback branch commit hash version (Leave blank to not modify)"
         required: false
-        default: "main/builtin/Numbersf/"
+        default: "main/builtin//"
       LZ4_UPDATE:
         type: boolean
         description: "是否升级LZ4到上游最新？//Upgrade LZ4 to the latest upstream?"
@@ -682,55 +682,33 @@ jobs:
             SHORT_HASH=${MANUAL_HASH:0:8}
           fi
 
-          KSU_VERSION_TAG=$(curl -fsSL https://api.github.com/repos/SukiSU-Ultra/SukiSU-Ultra/releases/latest \
-            | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-          if [[ -z "$KSU_VERSION_TAG" || "$(printf '%s\n' "$KSU_VERSION_TAG" "3.1.7" | sort -V | head -n1)" != "3.1.7" ]]; then
-            KSU_VERSION_TAG="3.1.7"
-          fi
-          echo "KSU_VERSION_TAG=$KSU_VERSION_TAG" >> $GITHUB_ENV
-
+          # IMPORTANT: do not overwrite SukiSU's kernel version metadata here.
+          # The selected SukiSU commit already owns KSU_VERSION/KSU_VERSION_FULL
+          # and its UAPI. Replacing these with an old hard-coded release tag can
+          # make the flashed kernel disagree with the current SukiSU Manager.
           GIT_HASH=$(git rev-parse --short HEAD)
-          echo "GIT_HASH=$GIT_HASH"
+          echo "KERNELSU_SELECTED_COMMIT=$GIT_HASH"
+          echo "KERNELSU_SELECTED_BRANCH=$KSU_BUILTIN_BRANCH"
 
-          # 组装版本号
-          if [[ -n "$MANUAL_HASH" ]]; then
-            USE_HASH="$SHORT_HASH"
+          # Keep the version calculation consistent with SukiSU's own Makefile.
+          # Current SukiSU uses VERSION_BASE 40000 and VERSION_OFFSET 2815.
+          # This is only used for the artifact name; the driver version itself
+          # remains controlled by KernelSU/Makefile.
+          KSU_VERSION=$(expr $(git rev-list --count main 2>/dev/null || echo 0) + 37185)
+          if [ "$KSU_VERSION" -le 37185 ]; then
+            echo "⚠️ Could not determine SukiSU main commit count; leaving artifact version unset."
+            echo "KSUVER=unknown" >> $GITHUB_ENV
           else
-            USE_HASH="$GIT_HASH"
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           fi
-          if [[ -z "$KSU_CUSTOM_TAG" ]]; then
-            VERSION_FULL="v$KSU_VERSION_TAG-$USE_HASH@$KSU_BUILTIN_BRANCH"
+
+          echo "::group::SukiSU kernel version metadata (source of truth)"
+          grep -nE '^(REPO_OWNER|REPO_NAME|REPO_BRANCH|VERSION_BASE|VERSION_OFFSET|KSU_VERSION[[:space:]]*:|VERSION_TAG|KSU_VERSION_FULL)' kernel/Makefile || true
+          if grep -RnsE 'KERNEL_SU_UAPI_VERSION[[:space:]]*=' . 2>/dev/null | head -n 20; then
+            :
           else
-            VERSION_FULL="v$KSU_VERSION_TAG-$KSU_CUSTOM_TAG@$KSU_BUILTIN_BRANCH[$USE_HASH]"
+            echo "KERNEL_SU_UAPI_VERSION definition not found in checked-out tree"
           fi
-
-          ESC_VERSION_FULL=$(printf '%s' "$VERSION_FULL" | sed 's/[&|\\/]/\\&/g')
-          ESC_KSU_VERSION_TAG=$(printf '%s' "$KSU_VERSION_TAG" | sed 's/[&|\\/]/\\&/g')
-
-          if grep -q '^KSU_VERSION_FULL := ' kernel/Makefile; then
-            sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := $ESC_VERSION_FULL|" kernel/Makefile
-          else
-            awk -v full="$VERSION_FULL" '
-              /^REPO_OWNER :=/ && !done {
-                print
-                print ""
-                print "KSU_VERSION_FULL := " full
-                done=1
-                next
-              }
-              { print }
-            ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
-          fi
-
-          if grep -q '^KSU_VERSION_API := ' kernel/Makefile; then
-            sed -i "s|^KSU_VERSION_API := .*|KSU_VERSION_API := $ESC_KSU_VERSION_TAG|" kernel/Makefile
-          fi
-
-          KSU_VERSION=$(expr $(git rev-list --count "$KSU_MANAGER_BRANCH" 2>/dev/null || echo 13000) + 37185)
-          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-
-          echo "::group::最终 Makefile 中版本信息及部分调试结果预览"
-          grep -nE '^(REPO_OWNER|REPO_NAME|REPO_BRANCH|KSU_VERSION_API|KSU_VERSION_FULL|VERSION_TAG|GIT_BIN|CURL_BIN)' kernel/Makefile
           echo "::endgroup::"
 
       - name: Apply Fake Patches
